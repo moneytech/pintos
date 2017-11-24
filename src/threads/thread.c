@@ -24,6 +24,10 @@
    that are ready to run but not actually running. */
 static struct list ready_list;
 
+/* List of threads that've been put to sleep by thread_sleep,
+    and are yet to woken. */
+static struct list sleep_list;
+
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
 static struct list all_list;
@@ -70,6 +74,7 @@ static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
+static void thread_wake (void);
 
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
@@ -91,6 +96,7 @@ thread_init (void)
 
   lock_init (&tid_lock);
   list_init (&ready_list);
+  list_init (&sleep_list);
   list_init (&all_list);
 
   /* Set up a thread structure for the running thread. */
@@ -137,6 +143,9 @@ thread_tick (void)
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
     intr_yield_on_return ();
+
+  /* Wake up any sleeping threads */
+  thread_wake ();
 }
 
 /* Prints thread statistics. */
@@ -239,6 +248,46 @@ thread_unblock (struct thread *t)
   ASSERT (t->status == THREAD_BLOCKED);
   list_push_back (&ready_list, &t->elem);
   t->status = THREAD_READY;
+  intr_set_level (old_level);
+}
+
+/* Sleeps for approximately TICKS timer ticks.  Interrupts must
+   be turned on. */
+void
+thread_sleep (int64_t ticks)
+{
+  struct thread *t;
+  enum intr_level old_level;
+
+  t = thread_current ();
+  t->ticks = ticks;
+
+  old_level = intr_disable ();
+  list_push_back (&sleep_list, &t->sleep_elem);
+  thread_block ();
+  intr_set_level (old_level);
+}
+
+/* Decrements `ticks` for all sleeping threads, and wakes up
+    any thread whose time is up. */
+static void
+thread_wake ()
+{
+  struct list_elem *e;
+  enum intr_level old_level;
+
+  old_level = intr_disable ();
+  e = list_begin (&sleep_list);
+  while (e != list_end (&sleep_list))
+    {
+      struct thread *t = list_entry (e, struct thread, sleep_elem);
+      t->ticks--;
+      if (t->ticks < 1) {
+        thread_unblock (t);
+        e = list_remove (e);
+      } else
+        e = list_next (e);
+    }
   intr_set_level (old_level);
 }
 
@@ -463,6 +512,7 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->magic = THREAD_MAGIC;
+  t->ticks = 0;
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
