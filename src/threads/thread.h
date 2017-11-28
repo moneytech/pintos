@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "threads/synch.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -23,6 +24,11 @@ typedef int tid_t;
 #define PRI_MIN 0                       /* Lowest priority. */
 #define PRI_DEFAULT 31                  /* Default priority. */
 #define PRI_MAX 63                      /* Highest priority. */
+
+/* Thread nice values. */
+#define NICE_MIN -20                    /* Lowest nice value. */
+#define NICE_DEFAULT 0                  /* Default nice value. */
+#define NICE_MAX 20                     /* Highest nice value. */
 
 /* A kernel thread or user process.
 
@@ -88,7 +94,6 @@ struct thread
     char name[16];                      /* Name (for debugging purposes). */
     uint8_t *stack;                     /* Saved stack pointer. */
     int priority;                       /* Priority. */
-    int64_t ticks;                      /* Tick count for sleeping threads. */
     struct list_elem sleep_elem;        /* List element for sleep list. */
     struct list_elem allelem;           /* List element for all threads list. */
 
@@ -99,6 +104,19 @@ struct thread
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
 #endif
+
+    /* For thread_sleep. */
+    int64_t ticks;                      /* Tick count for sleeping threads. */
+
+    /* For priority donation. */
+    int original_priority;              /* Priority before any donation. */
+    struct list locks;                  /* List of locks held by this thread that have
+                                           resulted in priority donation to it. */
+    struct thread *donated_to;          /* Thread receiving donation from this thread. */
+
+    /* For MLFQ scheduling. */
+    int32_t recent_cpu;                 /* Amount of CPU time received "recently". */
+    int nice;                           /* Nice value. */
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
@@ -129,6 +147,7 @@ const char *thread_name (void);
 
 void thread_exit (void) NO_RETURN;
 void thread_yield (void);
+void thread_check_priority_and_yield (void);
 
 /* Performs some operation on thread t, given auxiliary data AUX. */
 typedef void thread_action_func (struct thread *t, void *aux);
@@ -136,6 +155,11 @@ void thread_foreach (thread_action_func *, void *);
 
 int thread_get_priority (void);
 void thread_set_priority (int);
+void thread_donate_priority (struct thread *, struct lock *);
+void thread_revoke_priority (struct lock *);
+
+bool thread_more_func (const struct list_elem *, const struct list_elem *,
+                       void *);
 
 int thread_get_nice (void);
 void thread_set_nice (int);
