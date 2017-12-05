@@ -7,6 +7,7 @@
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
@@ -15,11 +16,57 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static int arg_bytes (char *, char);
+struct exit_stat *process_get_child_exit_status (tid_t child_pid);
+
+/* Returns a new per-process file descriptor for an opened file.
+   Only MAX_OPEN_FILES files may be open at a time by a process. */
+int
+process_allocate_fd (struct file *file)
+{
+  struct thread *cur = thread_current ();
+  int fd = cur->next_fd;
+
+  if (fd == MAX_OPEN_FILES)
+    return -1;
+  
+  cur->open_files[fd] = file;
+  cur->next_fd++;
+  while (cur->next_fd < MAX_OPEN_FILES &&
+         cur->open_files[cur->next_fd] != NULL)
+    cur->next_fd++;
+  return fd + 2;
+}
+
+/* Retrives the opened file mapped to a per-process file descriptor. */
+struct file *
+process_get_file (int fd)
+{
+  if (fd < 0 || fd >= MAX_OPEN_FILES)
+    return NULL;
+  return thread_current ()->open_files[fd - 2];
+}
+
+/* Deletes the per-process file descriptor. */
+void
+process_close_fd (int fd)
+{
+  struct thread *cur = thread_current ();
+
+  fd -= 2;
+  if (fd < 0 || fd >= MAX_OPEN_FILES)
+    return;
+
+  cur->open_files[fd] = NULL;
+  if (fd < cur->next_fd)
+    cur->next_fd = fd;
+}
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -41,8 +88,45 @@ process_execute (const char *file_name)
   /* Create a new thread to execute FILE_NAME. */
   tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    palloc_free_page (fn_copy);
+  else
+    {
+      struct thread *parent = thread_current ();
+
+      lock_acquire (&parent->l);
+      struct exit_stat *es = process_get_child_exit_status (tid);
+
+      /* Wait for process to attempt loading from its executable. */
+      if (es->thread != NULL)
+        sema_down (&es->thread->loaded);
+
+      /* If process didn't load sucessfully, or was terminated
+         by the kernel, free it's exit status and return -1. */
+      if (es->code == -1)
+        {
+          list_remove (&es->elem);
+          free (es);
+          tid = -1;
+        }
+      lock_release (&parent->l);
+    }
+  
   return tid;
+}
+
+/* Returns number of bytes needed to store arguments. */
+static int
+arg_bytes (char *str, char delim)
+{
+  int str_len = strlen (str);
+  int args_size = str_len + 1;
+  int i;
+
+  for (i = 0; i < str_len; i++)
+    if (str[i] == delim && 
+        (i == 0 || str[i - 1] == delim))
+      args_size--;
+  return args_size;
 }
 
 /* A thread function that loads a user process and starts it
@@ -50,21 +134,85 @@ process_execute (const char *file_name)
 static void
 start_process (void *file_name_)
 {
+  struct thread *cur = thread_current ();
   char *file_name = file_name_;
+  size_t arg_size;
+  char *token, *saveptr;
   struct intr_frame if_;
   bool success;
+  int tokens, i;
+  char delim;
+
+  /* Compute size for storing arguments. */
+  delim = ' ';
+  arg_size = arg_bytes (file_name, delim);
+
+  /* Extract executable file name. */
+  token = strtok_r (file_name, " ", &saveptr);
+  strlcpy(cur->name, token, strlen(token) + 1);
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  success = load (token, &if_.eip, &if_.esp);
 
-  /* If load failed, quit. */
+  if (!success)
+    cur->exit_stat->code = -1;
+
+  /* Signal our load attempt to our parent. */
+  sema_up (&cur->loaded);
+
+  if (!success)
+    {
+      palloc_free_page (file_name);
+      thread_exit ();
+    }
+
+  /* Setup the inital user process stack with passed arguments. */
+
+  uintptr_t *esp = (uintptr_t *)if_.esp - arg_size;
+  uint8_t *args = (uint8_t *)esp;
+
+  /* Align stack pointer to a word-boundry */
+  uintptr_t pad = (uintptr_t)esp % sizeof (uintptr_t);
+  uint8_t *padder = (uint8_t *)esp;
+  while (pad--)
+    *(--padder) = 0;
+  esp = (uintptr_t *)padder;
+
+  /* Push null sentinel */
+  *(--esp) = 0;
+
+  /* Push arguments and their addresses. Since we don't yet know the
+     number of arguments, we push their addresses in reserve order
+     and change the order later. */
+  for (tokens = 0; token != NULL; token = strtok_r (NULL, " ", &saveptr))
+    {
+      *(--esp) = (uintptr_t)args;
+      tokens++;
+      args += strlcpy ((char *)args, token, strlen(token) + 1) + 1;
+    }
+  /* Reverse argument addresses. */
+  for (i = 0; i < tokens/2; i++)
+    {
+      uintptr_t t = esp[i];
+      esp[i] = esp[tokens - 1 - i];
+      esp[tokens -1 - i] = t;
+    }
+
+  /* Push &argv */
+  uintptr_t argv_addr = (uintptr_t)esp;
+  *(--esp) = argv_addr;
+  /* Push argc */
+  *(--esp) = tokens;
+  /* Push fake return address */
+  *(--esp) = 0;
+
+  if_.esp = esp;
+
   palloc_free_page (file_name);
-  if (!success) 
-    thread_exit ();
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -86,9 +234,46 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid)
 {
-  return -1;
+  struct thread *parent = thread_current ();
+  int exit_code;
+
+  lock_acquire (&parent->l);
+  struct exit_stat *es = process_get_child_exit_status (child_tid);
+  if (es == NULL)
+    {
+      /* We have no child with given tid. */
+      lock_release (&parent->l);
+      return -1;
+    }
+
+  /* Wait for child to exit. */
+  if (es->thread != NULL)
+    sema_down (&es->thread->exited);
+
+  exit_code = es->code;
+  list_remove (&es->elem);
+  free (es);
+
+  lock_release (&parent->l);
+
+  return exit_code;
+}
+
+struct exit_stat *
+process_get_child_exit_status (tid_t pid)
+{
+  struct list_elem *e;
+  struct list *list = &thread_current ()->child_exit_stats;
+
+  for (e = list_begin (list); e != list_end (list); e = list_next (e))
+    {
+      struct exit_stat *es = list_entry (e, struct exit_stat, elem);
+      if (es->tid == pid)
+        return es;
+    }
+  return NULL;
 }
 
 /* Free the current process's resources. */
@@ -97,6 +282,7 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+  int fd;
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -114,6 +300,27 @@ process_exit (void)
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
+
+  /* Print our exit status. */
+  printf("%s: exit(%d)\n", cur->name, cur->exit_stat->code);
+
+  /* Close our executable file so writes to it
+     aren't blocked because of us. */
+  if (cur->exec_file != NULL)
+    file_close (cur->exec_file);
+  
+  /* Close any open file descriptors. */
+  lock_acquire (&fslock);
+  for (fd = 0; fd < MAX_OPEN_FILES; fd++)
+    if (cur->open_files[fd] != NULL)
+      file_close (cur->open_files[fd]);
+  lock_release (&fslock);
+
+  /* This serves as a flag to our parent that we exited. */
+  cur->exit_stat->thread = NULL;
+
+  /* Signal our exit to our waiting parent. */
+  sema_up (&cur->exited);
 }
 
 /* Sets up the CPU for running user code in the current
@@ -312,7 +519,13 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  if (!success)
+    file_close (file);
+  else
+    {
+      t->exec_file = file;
+      file_deny_write (file); 
+    }
   return success;
 }
 

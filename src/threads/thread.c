@@ -9,6 +9,7 @@
 #include "threads/interrupt.h"
 #include "threads/intr-stubs.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
@@ -318,6 +319,32 @@ thread_create (const char *name, int priority,
   sf->eip = switch_entry;
   sf->ebp = 0;
 
+  #ifdef USERPROG
+    struct thread *parent = thread_current ();
+    t->parent = parent;
+
+    t->open_files = calloc (sizeof (struct thread) * MAX_OPEN_FILES, 1);
+    if (t->open_files == NULL)
+      return TID_ERROR;
+
+    struct exit_stat *es = malloc (sizeof (struct exit_stat));
+    if (es == NULL)
+      {
+        free (t->open_files);
+        return TID_ERROR;
+      }
+    es->tid = tid;
+    es->thread = t;
+    t->exit_stat = es;
+
+    sema_init (&t->exited, 0);
+    sema_init (&t->loaded, 0);
+
+    lock_acquire (&parent->l);
+    list_push_back (&parent->child_exit_stats, &es->elem);
+    lock_release (&parent->l);
+  #endif
+
   /* Add to run queue. */
   thread_unblock (t);
   thread_check_priority_and_yield ();
@@ -457,16 +484,21 @@ thread_exit (void)
 {
   ASSERT (!intr_context ());
 
+  struct thread *cur = thread_current ();
+
 #ifdef USERPROG
   process_exit ();
+  free (cur->open_files);
 #endif
 
   /* Remove thread from all threads list, set our status to dying,
      and schedule another process.  That process will destroy us
      when it calls thread_schedule_tail(). */
   intr_disable ();
-  list_remove (&thread_current ()->allelem);
-  thread_current ()->status = THREAD_DYING;
+  list_remove (&cur->allelem);
+  if (cur->donor)
+    cur->donor->donated_to = cur->donated_to;
+  cur->status = THREAD_DYING;
   ready_threads -= 1;
   schedule ();
   NOT_REACHED ();
@@ -657,6 +689,7 @@ thread_donate_priority (struct thread *t, struct lock *lock)
      Since the tests don't check for nested multiple donation, it's fine to
      record just one thread. */
   thread_current ()->donated_to = t;
+  t->donor = thread_current ();
 }
 
 /* Revokes priority of current thread that was donated due to holding lock. */
@@ -816,6 +849,11 @@ init_thread (struct thread *t, const char *name, int priority, int nice)
     t->donated_to = NULL;
     list_init (&t->locks);
   }
+
+  #ifdef USERPROG
+    list_init (&t->child_exit_stats);
+    lock_init (&t->l);
+  #endif
 
   t->magic = THREAD_MAGIC;
 

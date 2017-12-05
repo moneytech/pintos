@@ -4,6 +4,7 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "threads/vaddr.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -89,6 +90,8 @@ kill (struct intr_frame *f)
       printf ("%s: dying due to interrupt %#04x (%s).\n",
               thread_name (), f->vec_no, intr_name (f->vec_no));
       intr_dump_frame (f);
+
+      thread_current ()->exit_stat->code = -1;
       thread_exit (); 
 
     case SEL_KCSEG:
@@ -148,14 +151,22 @@ page_fault (struct intr_frame *f)
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
 
-  /* To implement virtual memory, delete the rest of the function
-     body, and replace it with code that brings in the page to
-     which fault_addr refers. */
-  printf ("Page fault at %p: %s error %s page in %s context.\n",
-          fault_addr,
-          not_present ? "not present" : "rights violation",
-          write ? "writing" : "reading",
-          user ? "user" : "kernel");
-  kill (f);
+  /* If user address is accesed by the kernel, don't kill the thread
+     and instead help with `int get_user(const uint8_t *uaddr)` in userprog/syscall.c */
+  if (!user && is_user_vaddr (fault_addr))
+    {
+      /* eax points to a label right after the instruction
+         that caused this fault. */
+      f->eip = (void *)f->eax;
+      f->eax = -1;
+    }
+  else
+    {
+      printf ("Page fault at %p: %s error %s page in %s context.\n",
+              fault_addr,
+              not_present ? "not present" : "rights violation",
+              write ? "writing" : "reading",
+              user ? "user" : "kernel");
+      kill (f);
+    }
 }
-

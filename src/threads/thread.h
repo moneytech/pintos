@@ -30,6 +30,8 @@ typedef int tid_t;
 #define NICE_DEFAULT 0                  /* Default nice value. */
 #define NICE_MAX 20                     /* Highest nice value. */
 
+#define MAX_OPEN_FILES 128
+
 /* A kernel thread or user process.
 
    Each thread structure is stored in its own 4 kB page.  The
@@ -103,6 +105,20 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+
+    struct thread *parent;              /* Parent thread. */
+
+    struct lock l;                      /* Lock to protect child_exit_stats. */
+    struct list child_exit_stats;       /* List of child exit statuses. */
+    struct exit_stat *exit_stat;        /* Exit status. */
+
+    struct file **open_files;           /* File descriptor table. */
+    int next_fd;                        /* Next file descriptor to use for opening a file. */
+
+    struct semaphore loaded;            /* Semaphore for signaling process load from executable. */
+    struct semaphore exited;            /* Semaphore for signaling process exit. */
+
+    struct file *exec_file;             /* Process's opened executable file. */
 #endif
 
     /* For thread_sleep. */
@@ -113,6 +129,7 @@ struct thread
     struct list locks;                  /* List of locks held by this thread that have
                                            resulted in priority donation to it. */
     struct thread *donated_to;          /* Thread receiving donation from this thread. */
+    struct thread *donor;               /* Last thread to donate it's priority to this thread. */
 
     /* For MLFQ scheduling. */
     int32_t recent_cpu;                 /* Amount of CPU time received "recently". */
@@ -120,6 +137,19 @@ struct thread
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
+  };
+
+/* A thread's exit status
+
+   Inserted into parent thread's child exit status list.
+   Removed from it after the parent finishes waiting on it,
+   or when the parent dies. */
+struct exit_stat
+  {
+    int code;
+    tid_t tid;
+    struct thread *thread;
+    struct list_elem elem;
   };
 
 /* If false (default), use round-robin scheduler.
