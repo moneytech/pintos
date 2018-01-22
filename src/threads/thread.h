@@ -4,6 +4,8 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include <hash.h>
+#include "vm/frame.h"
 #include "threads/synch.h"
 
 /* States in a thread's life cycle. */
@@ -19,16 +21,6 @@ enum thread_status
    You can redefine this to whatever type you like. */
 typedef int tid_t;
 #define TID_ERROR ((tid_t) -1)          /* Error value for tid_t. */
-
-/* Thread priorities. */
-#define PRI_MIN 0                       /* Lowest priority. */
-#define PRI_DEFAULT 31                  /* Default priority. */
-#define PRI_MAX 63                      /* Highest priority. */
-
-/* Thread nice values. */
-#define NICE_MIN -20                    /* Lowest nice value. */
-#define NICE_DEFAULT 0                  /* Default nice value. */
-#define NICE_MAX 20                     /* Highest nice value. */
 
 #define MAX_OPEN_FILES 128
 
@@ -95,15 +87,12 @@ struct thread
     enum thread_status status;          /* Thread state. */
     char name[16];                      /* Name (for debugging purposes). */
     uint8_t *stack;                     /* Saved stack pointer. */
-    int priority;                       /* Priority. */
-    struct list_elem sleep_elem;        /* List element for sleep list. */
     struct list_elem allelem;           /* List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
 
 #ifdef USERPROG
-    /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
 
     struct thread *parent;              /* Parent thread. */
@@ -121,19 +110,12 @@ struct thread
     struct file *exec_file;             /* Process's opened executable file. */
 #endif
 
-    /* For thread_sleep. */
-    int64_t ticks;                      /* Tick count for sleeping threads. */
-
-    /* For priority donation. */
-    int original_priority;              /* Priority before any donation. */
-    struct list locks;                  /* List of locks held by this thread that have
-                                           resulted in priority donation to it. */
-    struct thread *donated_to;          /* Thread receiving donation from this thread. */
-    struct thread *donor;               /* Last thread to donate it's priority to this thread. */
-
-    /* For MLFQ scheduling. */
-    int32_t recent_cpu;                 /* Amount of CPU time received "recently". */
-    int nice;                           /* Nice value. */
+#ifdef VM
+    struct hash page_entries;
+    struct hash mmap_entries;
+    struct lock pagedir_lock;
+    void *user_esp;
+#endif
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
@@ -164,12 +146,10 @@ void thread_tick (void);
 void thread_print_stats (void);
 
 typedef void thread_func (void *aux);
-tid_t thread_create (const char *name, int priority, thread_func *, void *);
+tid_t thread_create (const char *name, thread_func *, void *);
 
 void thread_block (void);
 void thread_unblock (struct thread *);
-
-void thread_sleep (int64_t ticks);
 
 struct thread *thread_current (void);
 tid_t thread_tid (void);
@@ -177,23 +157,9 @@ const char *thread_name (void);
 
 void thread_exit (void) NO_RETURN;
 void thread_yield (void);
-void thread_check_priority_and_yield (void);
 
 /* Performs some operation on thread t, given auxiliary data AUX. */
 typedef void thread_action_func (struct thread *t, void *aux);
 void thread_foreach (thread_action_func *, void *);
-
-int thread_get_priority (void);
-void thread_set_priority (int);
-void thread_donate_priority (struct thread *, struct lock *);
-void thread_revoke_priority (struct lock *);
-
-bool thread_more_func (const struct list_elem *, const struct list_elem *,
-                       void *);
-
-int thread_get_nice (void);
-void thread_set_nice (int);
-int thread_get_recent_cpu (void);
-int thread_get_load_avg (void);
 
 #endif /* threads/thread.h */

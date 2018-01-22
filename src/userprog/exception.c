@@ -5,6 +5,14 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "filesys/file.h"
+#include "userprog/syscall.h"
+#include "userprog/pagedir.h"
+#include <hash.h>
+#ifdef VM
+#include "vm/frame.h"
+#include "vm/page.h"
+#endif
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -127,7 +135,7 @@ page_fault (struct intr_frame *f)
 {
   bool not_present;  /* True: not-present page, false: writing r/o page. */
   bool write;        /* True: access was write, false: access was read. */
-  bool user;         /* True: access by user, false: access by kernel. */
+  bool user_context; /* True: access by user, false: access by kernel. */
   void *fault_addr;  /* Fault address. */
 
   /* Obtain faulting address, the virtual address that was
@@ -149,24 +157,38 @@ page_fault (struct intr_frame *f)
   /* Determine cause. */
   not_present = (f->error_code & PF_P) == 0;
   write = (f->error_code & PF_W) != 0;
-  user = (f->error_code & PF_U) != 0;
+  user_context = (f->error_code & PF_U) != 0;
 
-  /* If user address is accesed by the kernel, don't kill the thread
-     and instead help with `int get_user(const uint8_t *uaddr)` in userprog/syscall.c */
-  if (!user && is_user_vaddr (fault_addr))
+  bool fault_handled = false;
+  if (is_user_vaddr (fault_addr))
+  {
+    void *esp;
+    if (user_context)
+      esp = f->esp;
+    else
+      esp = thread_current ()->user_esp;
+
+    if (not_present)
+      fault_handled = page_handle_fault (fault_addr, esp);
+
+    if (!fault_handled && !user_context)
     {
       /* eax points to a label right after the instruction
-         that caused this fault. */
+        that caused this fault. */
       f->eip = (void *)f->eax;
       f->eax = -1;
+      
+      fault_handled = true;
     }
-  else
+  }
+  
+  if (!fault_handled)
     {
       printf ("Page fault at %p: %s error %s page in %s context.\n",
               fault_addr,
               not_present ? "not present" : "rights violation",
               write ? "writing" : "reading",
-              user ? "user" : "kernel");
+              user_context ? "user" : "kernel");
       kill (f);
     }
 }

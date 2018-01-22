@@ -8,6 +8,7 @@
 #include "devices/input.h"
 #include "lib/kernel/console.h"
 #include "lib/user/syscall.h"
+#include "vm/mmap.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
 #include "filesys/filesys.h"
@@ -16,8 +17,11 @@ static void syscall_handler (struct intr_frame *);
 
 static int get_user (const uint8_t *);
 static uintptr_t get_user_word (const uint8_t *);
-static void check_user_buf_and_kill (const uint8_t *, unsigned);
-static void check_user_str_and_kill (const char *);
+static void check_user_buf_or_kill (const uint8_t *, unsigned);
+static void check_user_str_or_kill (const char *);
+static void put_user (uint8_t *, uint8_t);
+static void put_user_buf_or_kill (uint8_t *, unsigned);
+
 static void sys_halt (void);
 static void sys_exit (int);
 static pid_t sys_exec (const char *);
@@ -68,17 +72,46 @@ get_user_word (const uint8_t *uaddr)
 }
 
 static void
-check_user_buf_and_kill (const uint8_t *uaddr, unsigned len)
+check_user_buf_or_kill (const uint8_t *uaddr, unsigned len)
 {
   get_user (uaddr);
-  get_user (uaddr + len - 1);
+  get_user (uaddr + len);
 }
 
 static void
-check_user_str_and_kill (const char *str)
+check_user_str_or_kill (const char *str)
 {
   while (get_user ((const uint8_t *)str) != 0)
     str++;
+}
+
+static void
+put_user (uint8_t *uaddr, uint8_t byte)
+{
+  int read_result;
+  int write_result;
+
+  read_result = get_user (uaddr);
+  if (read_result != -1)
+    {
+      asm ("movl $1f, %0; movb %b2, %1; 1:"
+          : "=&a" (write_result), "=m" (*uaddr) : "q" (byte));
+
+      if (write_result != -1)
+        *uaddr = read_result;
+      else
+      {
+        thread_current ()->exit_stat->code = -1;
+        thread_exit ();
+      }
+    }
+}
+
+static void
+put_user_buf_or_kill (uint8_t *uaddr, unsigned len)
+{
+  put_user (uaddr, 0);
+  put_user (uaddr + len, 0);
 }
 
 static void
@@ -97,7 +130,7 @@ sys_exit (int exit_status)
 static pid_t
 sys_exec (const char *file)
 {
-  check_user_str_and_kill (file);
+  check_user_str_or_kill (file);
   return process_execute (file);
 }
 
@@ -112,7 +145,7 @@ sys_create (const char *file, unsigned initial_size)
 {
   bool ret;
 
-  check_user_str_and_kill (file);
+  check_user_str_or_kill (file);
 
   lock_acquire (&fslock);
   ret = filesys_create (file, initial_size);
@@ -125,7 +158,7 @@ sys_remove (const char *file)
 {
   bool ret;
 
-  check_user_str_and_kill (file);
+  check_user_str_or_kill (file);
 
   lock_acquire (&fslock);
   ret = filesys_remove (file);
@@ -139,7 +172,7 @@ sys_open (const char *file)
   struct file *f;
   int ret = -1;
 
-  check_user_str_and_kill (file);
+  check_user_str_or_kill (file);
 
   lock_acquire (&fslock);
   f = filesys_open (file);
@@ -172,7 +205,7 @@ sys_read (int fd, void *buffer_, unsigned length)
   struct file *f;
   int ret = -1;
 
-  check_user_buf_and_kill ((uint8_t *)buf, length);
+  put_user_buf_or_kill ((uint8_t *)buf, length);
 
   if (fd == STDOUT_FILENO)
     return -1;
@@ -200,7 +233,7 @@ sys_write (int fd, const void *buffer, unsigned length)
   struct file *f;
   int ret = -1;
 
-  check_user_buf_and_kill (buffer, length);
+  check_user_buf_or_kill (buffer, length);
 
   if (fd == STDIN_FILENO)
     return -1;
@@ -271,6 +304,8 @@ sys_close (int fd)
 static void
 syscall_handler (struct intr_frame *f) 
 {
+  thread_current ()->user_esp = f->esp;
+  
   switch (get_user_word(f->esp)) {
     case SYS_HALT:
       sys_halt ();
@@ -324,6 +359,15 @@ syscall_handler (struct intr_frame *f)
     case SYS_TELL:
       f->eax = sys_tell (
         (int) get_user_word (f->esp + 4)); /* fd */
+      break;
+    case SYS_MMAP:
+      f->eax = sys_mmap (
+        (int) get_user_word (f->esp + 4), /* fd */
+        (void *) get_user_word (f->esp + 8)); /* addr */
+      break;
+    case SYS_MUNMAP:
+      sys_munmap (
+        (mapid_t) get_user_word (f->esp + 4)); /* mapping */
       break;
     case SYS_CLOSE:
       sys_close (

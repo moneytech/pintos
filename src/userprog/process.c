@@ -19,6 +19,11 @@
 #include "threads/malloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#ifdef VM
+#include "vm/frame.h"
+#include "vm/mmap.h"
+#include "vm/page.h"
+#endif
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -86,7 +91,7 @@ process_execute (const char *file_name)
   strlcpy (fn_copy, file_name, PGSIZE);
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (file_name, start_process, fn_copy);
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy);
   else
@@ -156,7 +161,10 @@ start_process (void *file_name_)
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
+
+  lock_acquire (&fslock);
   success = load (token, &if_.eip, &if_.esp);
+  lock_release (&fslock);
 
   if (!success)
     cur->exit_stat->code = -1;
@@ -289,6 +297,11 @@ process_exit (void)
   pd = cur->pagedir;
   if (pd != NULL) 
     {
+      #ifdef VM
+        mmap_destory ();
+        page_destroy ();
+      #endif
+
       /* Correct ordering here is crucial.  We must set
          cur->pagedir to NULL before switching page directories,
          so that a timer interrupt can't switch back to the
@@ -304,13 +317,13 @@ process_exit (void)
   /* Print our exit status. */
   printf("%s: exit(%d)\n", cur->name, cur->exit_stat->code);
 
+  lock_acquire (&fslock);
   /* Close our executable file so writes to it
      aren't blocked because of us. */
   if (cur->exec_file != NULL)
     file_close (cur->exec_file);
   
   /* Close any open file descriptors. */
-  lock_acquire (&fslock);
   for (fd = 0; fd < MAX_OPEN_FILES; fd++)
     if (cur->open_files[fd] != NULL)
       file_close (cur->open_files[fd]);
@@ -498,8 +511,13 @@ load (const char *file_name, void (**eip) (void), void **esp)
                   read_bytes = 0;
                   zero_bytes = ROUND_UP (page_offset + phdr.p_memsz, PGSIZE);
                 }
-              if (!load_segment (file, file_page, (void *) mem_page,
-                                 read_bytes, zero_bytes, writable))
+
+              bool loaded;
+              lock_release (&fslock);
+              loaded = load_segment (file, file_page, (void *) mem_page,
+                                 read_bytes, zero_bytes, writable);
+              lock_acquire (&fslock);              
+              if (!loaded)
                 goto done;
             }
           else
@@ -600,7 +618,6 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
-  file_seek (file, ofs);
   while (read_bytes > 0 || zero_bytes > 0) 
     {
       /* Calculate how to fill this page.
@@ -609,28 +626,19 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-      /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
-      if (kpage == NULL)
-        return false;
-
-      /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
-
-      /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable)) 
-        {
-          palloc_free_page (kpage);
-          return false; 
+      if (page_zero_bytes >= PGSIZE)
+        page_add_zero (upage, writable);
+      else
+        { 
+          if (writable)
+            page_add_file_without_backing (upage, writable, file, page_read_bytes, ofs);
+          else
+            page_add_file (upage, writable, file, page_read_bytes, ofs);
         }
 
       /* Advance. */
       read_bytes -= page_read_bytes;
+      ofs += page_read_bytes;
       zero_bytes -= page_zero_bytes;
       upage += PGSIZE;
     }
